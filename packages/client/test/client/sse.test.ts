@@ -1636,6 +1636,31 @@ describe('SSEClientTransport', () => {
             expect(globalFetchSpy).not.toHaveBeenCalled();
         });
 
+        it('drops a stored grant the authorization server refuses on 401 re-authorization', async () => {
+            // The 401 path asked for the challenge plus the token's `read write`; an admin has since
+            // removed `write`, and there is no refresh token that would otherwise clear the grant.
+            const provider = createMockAuthProvider({ clientRegistered: true });
+            provider.tokens.mockResolvedValue({ access_token: 'valid-token', token_type: 'Bearer', scope: 'read write' });
+            transport = new SSEClientTransport(resourceBaseUrl, { authProvider: provider, fetch: customFetch });
+            (transport as unknown as { _scope?: string })._scope = 'read write';
+
+            await expect(transport.finishAuth(new URLSearchParams({ error: 'invalid_scope' }))).rejects.toThrow(OAuthError);
+
+            expect(provider.invalidateCredentials).toHaveBeenCalledWith('tokens');
+            expect((transport as unknown as { _scope?: string })._scope).toBeUndefined();
+            expect(globalFetchSpy).not.toHaveBeenCalled();
+        });
+
+        it('keeps a stored grant when the callback fails for another reason', async () => {
+            const provider = createMockAuthProvider({ clientRegistered: true });
+            provider.tokens.mockResolvedValue({ access_token: 'valid-token', token_type: 'Bearer', scope: 'read write' });
+            transport = new SSEClientTransport(resourceBaseUrl, { authProvider: provider, fetch: customFetch });
+
+            await expect(transport.finishAuth(new URLSearchParams({ error: 'access_denied' }))).rejects.toThrow(OAuthError);
+
+            expect(provider.invalidateCredentials).not.toHaveBeenCalled();
+        });
+
         it('uses custom fetch in finishAuth method - no global fetch fallback', async () => {
             // Create mock auth provider that expects to save tokens
             const authProviderWithCode = createMockAuthProvider({

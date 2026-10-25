@@ -20,6 +20,7 @@ import {
     auth,
     computeScopeUnion,
     extractWWWAuthenticateParams,
+    isInvalidScopeError,
     isOAuthClientProvider,
     resolveAuthorizationCallbackParams,
     UnauthorizedError
@@ -408,18 +409,27 @@ export class SSEClientTransport implements Transport {
             throw new UnauthorizedError('finishAuth requires an OAuthClientProvider');
         }
 
-        const { authorizationCode, iss: issParam } = await resolveAuthorizationCallbackParams(
-            codeOrParams,
-            iss,
-            this._oauthProvider,
-            this._url,
-            { fetchFn: this._fetchWithInit, resourceMetadataUrl: this._resourceMetadataUrl }
-        );
+        let callback: { authorizationCode: string; iss: string | undefined };
+        try {
+            callback = await resolveAuthorizationCallbackParams(codeOrParams, iss, this._oauthProvider, this._url, {
+                fetchFn: this._fetchWithInit,
+                resourceMetadataUrl: this._resourceMetadataUrl
+            });
+        } catch (error) {
+            if (isInvalidScopeError(error)) {
+                // The 401 re-authorization asked for the challenge plus the stored token's scope, and the
+                // authorization server refused it. That grant is stale: drop it and the accumulated
+                // scope, so the next 401 asks for the challenge alone.
+                await this._oauthProvider.invalidateCredentials?.('tokens');
+                this._scope = undefined;
+            }
+            throw error;
+        }
 
         const result = await auth(this._oauthProvider, {
             serverUrl: this._url,
-            authorizationCode,
-            iss: issParam,
+            authorizationCode: callback.authorizationCode,
+            iss: callback.iss,
             resourceMetadataUrl: this._resourceMetadataUrl,
             scope: this._scope,
             fetchFn: this._fetchWithInit,

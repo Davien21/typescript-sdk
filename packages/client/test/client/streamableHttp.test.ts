@@ -1497,115 +1497,198 @@ describe('StreamableHTTPClientTransport', () => {
             authSpy.mockRestore();
         });
 
-        it('keeps a redirected step-up scope only once finishAuth saves tokens for it', async () => {
-            mockAuthProvider.tokens.mockResolvedValue({
-                access_token: 'test-token',
-                token_type: 'Bearer',
-                scope: 'read'
-            });
-            (globalThis.fetch as Mock).mockResolvedValueOnce({
-                ok: false,
-                status: 403,
-                statusText: 'Forbidden',
-                headers: new Headers({ 'WWW-Authenticate': 'Bearer error="insufficient_scope", scope="admin"' }),
-                text: () => Promise.resolve('Insufficient scope')
-            });
-            const authSpy = vi.spyOn(authModule, 'auth');
-            authSpy.mockResolvedValue('REDIRECT');
-            const scopeOf = () => (transport as unknown as { _scope?: string })._scope;
-
-            await expect(transport.send(message)).rejects.toThrow(UnauthorizedError);
-            expect(scopeOf()).toBeUndefined();
-
-            authSpy.mockResolvedValue('AUTHORIZED');
-            await transport.finishAuth('code');
-            expect(authSpy).toHaveBeenLastCalledWith(mockAuthProvider, expect.objectContaining({ scope: 'read admin' }));
-            expect(scopeOf()).toBe('read admin');
-
-            authSpy.mockRestore();
-        });
-
-        it('drops a redirected step-up scope when the user declines it', async () => {
-            mockAuthProvider.tokens.mockResolvedValue({
-                access_token: 'test-token',
-                token_type: 'Bearer',
-                scope: 'read'
-            });
-            (globalThis.fetch as Mock).mockResolvedValueOnce({
-                ok: false,
-                status: 403,
-                statusText: 'Forbidden',
-                headers: new Headers({ 'WWW-Authenticate': 'Bearer error="insufficient_scope", scope="admin"' }),
-                text: () => Promise.resolve('Insufficient scope')
-            });
-            const authSpy = vi.spyOn(authModule, 'auth');
-            authSpy.mockResolvedValue('REDIRECT');
-
-            await expect(transport.send(message)).rejects.toThrow(UnauthorizedError);
-            await expect(
-                transport.finishAuth(new URLSearchParams({ error: 'access_denied', error_description: 'declined' }))
-            ).rejects.toThrow();
-            expect((transport as unknown as { _scope?: string })._scope).toBeUndefined();
-            expect((transport as unknown as { _pendingStepUpScope?: string })._pendingStepUpScope).toBeUndefined();
-
-            authSpy.mockRestore();
-        });
-
-        it('drops an abandoned step-up scope once a 401 starts a new authorization', async () => {
-            // A small server: metadata and the token endpoint answer any number of times; only the
-            // MCP endpoint is scripted, because it is the server whose state changes.
-            const mcpResponses = [
+        describe('against an OAuth-protected server', () => {
+            /**
+             * An OAuth-protected MCP server behind the transport's `fetch` option. Metadata and the
+             * token endpoint answer any number of times; only the MCP endpoint is scripted, through
+             * `mcp`. The real `auth()` runs, so assertions stay on what the user sees: the scope in
+             * each authorization URL the provider is asked to open.
+             */
+            const createFakeOAuthServer = (mcp: (body: JSONRPCRequest | undefined) => Response | undefined) => {
+                let grantedScope: string | undefined;
+                const fetch: FetchLike = async (input, init) => {
+                    const request = new Request(input, init);
+                    const url = new URL(request.url);
+                    if (url.pathname.startsWith('/.well-known/oauth-protected-resource')) {
+                        return Response.json({ resource: 'http://localhost:1234/mcp', authorization_servers: ['http://localhost:1234'] });
+                    }
+                    if (url.pathname.startsWith('/.well-known/oauth-authorization-server')) {
+                        return Response.json({
+                            issuer: 'http://localhost:1234',
+                            authorization_endpoint: 'http://localhost:1234/authorize',
+                            token_endpoint: 'http://localhost:1234/token',
+                            response_types_supported: ['code'],
+                            code_challenge_methods_supported: ['S256']
+                        });
+                    }
+                    if (url.pathname === '/token') {
+                        return Response.json({
+                            access_token: `token-${Math.random()}`,
+                            token_type: 'Bearer',
+                            ...(grantedScope ? { scope: grantedScope } : {})
+                        });
+                    }
+                    if (url.pathname === '/mcp') {
+                        const body = request.method === 'POST' ? ((await request.json()) as JSONRPCRequest) : undefined;
+                        return mcp(body) ?? new Response(null, { status: 202 });
+                    }
+                    throw new Error(`Unexpected request: ${url}`);
+                };
+                return {
+                    fetch,
+                    /** Scope the token endpoint reports from now on; omitted means "as requested" (RFC 6749 §5.1). */
+                    grant: (scope: string) => {
+                        grantedScope = scope;
+                    }
+                };
+            };
+            const unauthorized = (scope?: string) =>
+                new Response('Unauthorized', {
+                    status: 401,
+                    headers: { 'WWW-Authenticate': scope ? `Bearer scope="${scope}"` : 'Bearer realm="test"' }
+                });
+            const insufficientScope = (scope: string) =>
                 new Response('Insufficient scope', {
                     status: 403,
-                    headers: { 'WWW-Authenticate': 'Bearer error="insufficient_scope", scope="admin"' }
-                }),
-                new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="test"' } }),
-                new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Bearer realm="test"' } })
-            ];
-            const serverFetch: FetchLike = async input => {
-                const url = new URL(input instanceof Request ? input.url : input);
-                if (url.pathname.startsWith('/.well-known/oauth-protected-resource')) {
-                    return Response.json({ resource: 'http://localhost:1234/mcp', authorization_servers: ['http://localhost:1234'] });
-                }
-                if (url.pathname.startsWith('/.well-known/oauth-authorization-server')) {
-                    return Response.json({
-                        issuer: 'http://localhost:1234',
-                        authorization_endpoint: 'http://localhost:1234/authorize',
-                        token_endpoint: 'http://localhost:1234/token',
-                        response_types_supported: ['code'],
-                        code_challenge_methods_supported: ['S256']
-                    });
-                }
-                if (url.pathname === '/token') {
-                    return Response.json({ access_token: 'new-token', token_type: 'Bearer', scope: 'read' });
-                }
-                if (url.pathname === '/mcp') {
-                    return mcpResponses.shift() ?? new Response(null, { status: 202 });
-                }
-                throw new Error(`Unexpected request: ${url}`);
+                    headers: { 'WWW-Authenticate': `Bearer error="insufficient_scope", scope="${scope}"` }
+                });
+            /** Make the mock provider keep tokens like a real one, so `finishAuth` and invalidation are observable. */
+            const storeTokens = (initial?: OAuthTokens) => {
+                let stored = initial;
+                mockAuthProvider.tokens.mockImplementation(async () => stored);
+                mockAuthProvider.saveTokens.mockImplementation(async (tokens: OAuthTokens) => {
+                    stored = tokens;
+                });
+                (mockAuthProvider.invalidateCredentials as Mock).mockImplementation(async (scope: string) => {
+                    if (scope === 'tokens' || scope === 'all') stored = undefined;
+                });
             };
-            mockAuthProvider.tokens.mockResolvedValue({ access_token: 'test-token', token_type: 'Bearer', scope: 'read' });
-            mockAuthProvider.codeVerifier.mockResolvedValue('verifier');
-            const authorizeScopes = () =>
-                mockAuthProvider.redirectToAuthorization.mock.calls.map(([url]) => (url as URL).searchParams.get('scope'));
-            const serverTransport = new StreamableHTTPClientTransport(new URL('http://localhost:1234/mcp'), {
-                authProvider: mockAuthProvider,
-                fetch: serverFetch
+            const scopeOf = (url: unknown) => new Set((url as URL).searchParams.get('scope')?.split(' '));
+            /** Scope sets of the authorization URLs the user has been sent to, in order. */
+            const authorizeScopes = () => mockAuthProvider.redirectToAuthorization.mock.calls.map(([url]) => scopeOf(url));
+            const callbackError = (error: string) => new URLSearchParams({ error, error_description: error });
+            const transports: StreamableHTTPClientTransport[] = [];
+            const connect = (server: { fetch: FetchLike }) => {
+                const t = new StreamableHTTPClientTransport(new URL('http://localhost:1234/mcp'), {
+                    authProvider: mockAuthProvider,
+                    fetch: server.fetch
+                });
+                transports.push(t);
+                return t;
+            };
+            afterEach(async () => {
+                await Promise.all(transports.splice(0).map(t => t.close().catch(() => {})));
             });
 
-            // Step-up asks for "read admin"; the user never returns from that link.
-            await expect(serverTransport.send(message)).rejects.toThrow(UnauthorizedError);
-            expect(authorizeScopes()).toEqual(['read admin']);
+            it('keeps a step-up scope once finishAuth saves tokens for it', async () => {
+                storeTokens({ access_token: 'old', token_type: 'Bearer', scope: 'read' });
+                const responses = [insufficientScope('admin'), unauthorized('read')];
+                const t = connect(createFakeOAuthServer(() => responses.shift()));
 
-            // The next request gets a plain 401, which starts a new authorization for the known scope.
-            await expect(serverTransport.send(message)).rejects.toThrow(UnauthorizedError);
-            expect(authorizeScopes()).toEqual(['read admin', 'read']);
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes()).toEqual([new Set(['read', 'admin'])]);
 
-            // Finishing that authorization must not revive the abandoned step-up scope.
-            await serverTransport.finishAuth('code');
-            await expect(serverTransport.send(message)).rejects.toThrow(UnauthorizedError);
-            expect(authorizeScopes()).toEqual(['read admin', 'read', 'read']);
-            await serverTransport.close().catch(() => {});
+                // The token endpoint omits `scope`, so the transport is the only record of the grant.
+                await t.finishAuth('code');
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes().at(-1)).toEqual(new Set(['read', 'admin']));
+            });
+
+            it('drops a step-up scope the user declines', async () => {
+                storeTokens({ access_token: 'old', token_type: 'Bearer', scope: 'read' });
+                const responses = [insufficientScope('admin'), unauthorized('read')];
+                const t = connect(createFakeOAuthServer(() => responses.shift()));
+
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                await expect(t.finishAuth(callbackError('access_denied'))).rejects.toThrow(OAuthError);
+                expect(mockAuthProvider.invalidateCredentials).not.toHaveBeenCalled();
+
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes().at(-1)).toEqual(new Set(['read']));
+            });
+
+            it('drops an abandoned step-up scope once a 401 starts a new authorization', async () => {
+                storeTokens({ access_token: 'old', token_type: 'Bearer', scope: 'read' });
+                const responses = [insufficientScope('admin'), unauthorized(), unauthorized('read')];
+                const server = createFakeOAuthServer(() => responses.shift());
+                server.grant('read');
+                const t = connect(server);
+
+                // The user never returns from the step-up link; the next request gets a plain 401.
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes()).toEqual([new Set(['read', 'admin']), new Set(['read'])]);
+
+                // Finishing that authorization must not revive the abandoned step-up scope.
+                await t.finishAuth('code');
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes().at(-1)).toEqual(new Set(['read']));
+            });
+
+            it('widens one request when step-ups run in parallel', async () => {
+                storeTokens({ access_token: 'old', token_type: 'Bearer', scope: 'read' });
+                const needed = new Map([
+                    ['write-tool', 'write'],
+                    ['admin-tool', 'admin'],
+                    ['billing-tool', 'billing']
+                ]);
+                const afterwards: Response[] = [];
+                const t = connect(
+                    createFakeOAuthServer(body => {
+                        const name = (body?.params as { name?: string } | undefined)?.name;
+                        const scope = name ? needed.get(name) : undefined;
+                        if (name && scope) {
+                            needed.delete(name);
+                            return insufficientScope(scope);
+                        }
+                        return afterwards.shift();
+                    })
+                );
+                const call = (name: string): JSONRPCMessage => ({ jsonrpc: '2.0', id: name, method: 'tools/call', params: { name } });
+
+                const results = await Promise.allSettled([
+                    t.send(call('write-tool')),
+                    t.send(call('admin-tool')),
+                    t.send(call('billing-tool'))
+                ]);
+                expect(results.map(r => r.status)).toEqual(['rejected', 'rejected', 'rejected']);
+                // Each step-up builds on the ones in flight, so the widest link asks for everything.
+                // (Which redirect fires last depends on discovery timing, as on main.)
+                expect(authorizeScopes()).toContainEqual(new Set(['read', 'write', 'admin', 'billing']));
+
+                await t.finishAuth('code');
+                afterwards.push(unauthorized('read'));
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes().at(-1)).toEqual(new Set(['read', 'write', 'admin', 'billing']));
+            });
+
+            it('clears a stored grant the authorization server refuses on 401 re-authorization', async () => {
+                // No refresh token, so nothing else would ever invalidate this grant.
+                storeTokens({ access_token: 'old', token_type: 'Bearer', scope: 'read write' });
+                const responses = [unauthorized('read'), unauthorized('read')];
+                const t = connect(createFakeOAuthServer(() => responses.shift()));
+
+                // The 401 re-authorization keeps the granted `write`; an admin has since removed it.
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes()).toEqual([new Set(['read', 'write'])]);
+                await expect(t.finishAuth(callbackError('invalid_scope'))).rejects.toThrow(OAuthError);
+                expect(mockAuthProvider.invalidateCredentials).toHaveBeenCalledWith('tokens');
+
+                // The next attempt asks for the challenge alone, so the user can sign in.
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                expect(authorizeScopes().at(-1)).toEqual(new Set(['read']));
+            });
+
+            it('keeps the token when the authorization server refuses a step-up', async () => {
+                storeTokens({ access_token: 'old', token_type: 'Bearer', scope: 'read' });
+                const responses = [insufficientScope('admin')];
+                const t = connect(createFakeOAuthServer(() => responses.shift()));
+
+                await expect(t.send(message)).rejects.toThrow(UnauthorizedError);
+                await expect(t.finishAuth(callbackError('invalid_scope'))).rejects.toThrow(OAuthError);
+                expect(mockAuthProvider.invalidateCredentials).not.toHaveBeenCalled();
+                expect(await mockAuthProvider.tokens()).toMatchObject({ access_token: 'old' });
+            });
         });
 
         it('keeps accumulated scope after a 401 challenge without scope', async () => {

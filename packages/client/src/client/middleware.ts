@@ -52,13 +52,11 @@ export const withOAuth =
         const next = provider.dpop ? withDpopFromProvider(provider)(baseNext) : baseNext;
 
         return async (input, init) => {
-            let lastTokenScope: string | undefined;
             const makeRequest = async (): Promise<Response> => {
                 const headers = new Headers(init?.headers);
 
                 // Add authorization header if tokens are available
                 const tokens = await provider.tokens();
-                lastTokenScope = tokens?.scope;
                 if (tokens) {
                     headers.set('Authorization', `Bearer ${tokens.access_token}`);
                 }
@@ -80,8 +78,6 @@ export const withOAuth =
                         serverUrl,
                         resourceMetadataUrl,
                         scope,
-                        // The refresh still runs first; a new authorization keeps the token's earlier grant.
-                        ...(lastTokenScope ? { priorScope: lastTokenScope } : {}),
                         fetchFn: baseNext
                     });
 

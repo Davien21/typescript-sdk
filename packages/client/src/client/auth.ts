@@ -1107,6 +1107,16 @@ export async function auth(provider: OAuthClientProvider, options: AuthOptions):
 }
 
 /**
+ * Whether an authorization callback or token response refused the requested scope
+ * (`invalid_scope`, RFC 6749 §4.1.2.1 and §5.2).
+ *
+ * @internal Used by the transports' `finishAuth`.
+ */
+export function isInvalidScopeError(error: unknown): boolean {
+    return error instanceof OAuthError && error.code === OAuthErrorCode.InvalidScope;
+}
+
+/**
  * The part of `priorScope` worth requesting again: when the authorization server advertises
  * `scopes_supported`, only those values. A token's `scope` can hold values the server does not
  * accept back in a request (expanded forms, another server's names after a migration).

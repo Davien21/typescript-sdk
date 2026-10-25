@@ -29,6 +29,7 @@ import {
     auth,
     computeScopeUnion,
     extractWWWAuthenticateParams,
+    isInvalidScopeError,
     isOAuthClientProvider,
     isStrictScopeSuperset,
     resolveAuthorizationCallbackParams,
@@ -345,7 +346,10 @@ export class StreamableHTTPClientTransport implements Transport {
     private _url: URL;
     private _resourceMetadataUrl?: URL;
     private _scope?: string;
-    /** A step-up union waiting for `finishAuth()`; it joins `_scope` once tokens for it are saved. */
+    /**
+     * Scope requested by step-ups still waiting for a token. Later step-ups build on it, so
+     * parallel challenges end in one union; it joins `_scope` once tokens for it are saved.
+     */
     private _pendingStepUpScope?: string;
     private _requestInit?: RequestInit;
     private _authProvider?: AuthProvider;
@@ -458,7 +462,9 @@ export class StreamableHTTPClientTransport implements Transport {
         // Spec step-up: union of previously-requested scope and challenged scope,
         // so previously-granted permissions are not lost on re-authorization.
         const tokens = await this._oauthProvider.tokens();
-        const unionScope = computeScopeUnion(this._scope, tokens?.scope, challenge.scope);
+        const unionScope = computeScopeUnion(this._pendingStepUpScope, this._scope, tokens?.scope, challenge.scope);
+        // Recorded before `auth()` resolves, so a step-up racing this one widens the same request.
+        this._pendingStepUpScope = unionScope;
 
         // Superset-gated refresh bypass: refresh cannot widen scope (RFC 6749 §6),
         // so when the union strictly exceeds what the current token was granted
@@ -473,9 +479,11 @@ export class StreamableHTTPClientTransport implements Transport {
             fetchFn: this._fetchWithInit,
             skipIssuerMetadataValidation: this._skipIssuerMetadataValidation
         });
-        // Keep the union only once granted, so a later 401 does not re-request a refused or declined scope.
-        if (result === 'AUTHORIZED') this._scope = unionScope;
-        else this._pendingStepUpScope = unionScope;
+        // `_scope` widens only once granted, so a later 401 does not re-request a refused or declined scope.
+        if (result === 'AUTHORIZED') {
+            this._scope = computeScopeUnion(this._scope, unionScope);
+            if (this._pendingStepUpScope === unionScope) this._pendingStepUpScope = undefined;
+        }
         return result;
     }
 
@@ -954,18 +962,27 @@ export class StreamableHTTPClientTransport implements Transport {
         // A declined or failed callback drops the pending step-up scope too.
         const pendingStepUpScope = this._pendingStepUpScope;
         this._pendingStepUpScope = undefined;
-        const { authorizationCode, iss: issParam } = await resolveAuthorizationCallbackParams(
-            codeOrParams,
-            iss,
-            this._oauthProvider,
-            this._url,
-            { fetchFn: this._fetchWithInit, resourceMetadataUrl: this._resourceMetadataUrl }
-        );
+        let callback: { authorizationCode: string; iss: string | undefined };
+        try {
+            callback = await resolveAuthorizationCallbackParams(codeOrParams, iss, this._oauthProvider, this._url, {
+                fetchFn: this._fetchWithInit,
+                resourceMetadataUrl: this._resourceMetadataUrl
+            });
+        } catch (error) {
+            if (!pendingStepUpScope && isInvalidScopeError(error)) {
+                // Not a step-up, so a 401 re-authorization asked for the challenge plus the stored
+                // token's scope, and the authorization server refused it. That grant is stale: drop
+                // it and the accumulated scope, so the next 401 asks for the challenge alone.
+                await this._oauthProvider.invalidateCredentials?.('tokens');
+                this._scope = undefined;
+            }
+            throw error;
+        }
 
         const result = await auth(this._oauthProvider, {
             serverUrl: this._url,
-            authorizationCode,
-            iss: issParam,
+            authorizationCode: callback.authorizationCode,
+            iss: callback.iss,
             resourceMetadataUrl: this._resourceMetadataUrl,
             scope: pendingStepUpScope ?? this._scope,
             fetchFn: this._fetchWithInit,
@@ -974,7 +991,12 @@ export class StreamableHTTPClientTransport implements Transport {
         if (result !== 'AUTHORIZED') {
             throw new UnauthorizedError('Failed to authorize');
         }
-        if (pendingStepUpScope) this._scope = pendingStepUpScope;
+        if (pendingStepUpScope) {
+            // Commit what was granted: the token's reported scope when there is one, else the request
+            // (RFC 6749 §5.1: an omitted scope means the requested one).
+            const saved = await this._oauthProvider.tokens();
+            this._scope = computeScopeUnion(this._scope, saved?.scope ?? pendingStepUpScope);
+        }
     }
 
     async close(): Promise<void> {
